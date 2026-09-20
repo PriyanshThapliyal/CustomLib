@@ -5,42 +5,100 @@
 #include <cstdint>
 #include <pthread.h>
 #include <cstring>
-typedef char ALIGN[16];
 
+constexpr size_t ALIGNMENT = 16;
+
+// Align up round up input byte to multiple of 16
+inline size_t align_up(size_t size)
+{
+  if(size > SIZE_MAX - (ALIGNMENT - 1)) return 0; // Signals overflow of size
+  return (size + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1); 
+}
 
 // Header Block with count of size allocated
 // with a is_free tag and pointer to next header block
 // It is set to 16bytes to align 
 
-union header {
-    struct {
+struct alignas(16) header{
         size_t size;
         unsigned is_free;
-        union header *next;
-    } s;
-    ALIGN stub;
+        header *next;
+        header *prev;
 };
 
-typedef union header header_t;
+typedef  header header_t;
 
 
 // Global thread lock
-pthread_mutex_t global_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
+inline pthread_mutex_t global_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Head and tail pointer for header block
-header_t *head = nullptr, *tail = nullptr;
+inline header_t *head = nullptr, *tail = nullptr;
 
+
+// Method for splitting the block
+inline void split_block(header_t *block_header, size_t size)
+{
+    if(block_header->size >= size + sizeof(header_t) + ALIGNMENT)
+    {
+        header_t *new_block = reinterpret_cast<header_t*>(reinterpret_cast<char*>(block_header + 1) + size);
+
+        new_block->size = block_header->size - size - sizeof(header_t);
+        new_block->is_free = 1;
+        new_block->prev = block_header;
+        new_block->next = block_header->next;
+
+        if(new_block->next)
+            new_block->next->prev = new_block;
+        else
+            tail = new_block;
+
+        block_header->next = new_block;
+        block_header->size = size;
+    }
+}
+
+// Method to merge two memory block 
+inline header_t* merge_block(header_t *block_header)
+{
+    // Merge in next if block is free
+    if(block_header->next && block_header->next->is_free)
+    {
+        block_header->size += sizeof(header_t) + block_header->next->size;
+        block_header->next = block_header->next->next;
+
+        if(block_header->next)
+            block_header->next->prev = block_header;
+        else
+            tail = block_header;
+    }
+
+    if(block_header->prev && block_header->prev->is_free)
+    {
+        block_header->prev->size += sizeof(header_t) + block_header->size;
+        block_header->prev->next = block_header->next;
+        if(block_header->next)
+            block_header->next->prev = block_header->prev;
+        else 
+            tail = block_header->prev;
+    }
+    if(block_header->prev && block_header->prev->is_free)
+        block_header = block_header->prev;
+    return block_header;
+
+}
 // Method used to check if there is free memory block that can be used
-header_t *get_free_block(size_t size)
+inline header_t *get_free_block(size_t size)
 {
     header_t *curr = head;
     while(curr)
     {
-        if(curr->s.is_free && curr->s.size >= size)
+        if(curr->is_free && curr->size >= size)
         {
+            split_block(curr,size); 
             return curr;
         }
-        curr = curr->s.next;
+        curr = curr->next;
     }
     return NULL;
 }
@@ -48,10 +106,10 @@ header_t *get_free_block(size_t size)
 // Custom Memory Allocation
 inline void* my_malloc(size_t size)
 {   
-    size_t total_size;
+    size = align_up(size);
     void* block; // pointer to Memory block allocated
     header_t* block_header; // Pointer to Metadata 
-
+                            
     if(!size)
         return NULL;
         
@@ -61,13 +119,24 @@ inline void* my_malloc(size_t size)
 
     if(block_header)
     {
-        block_header->s.is_free = 0;  // Set this block to not free
+        block_header->is_free = 0;  // Set this block to not free
         pthread_mutex_unlock(&global_malloc_lock);
         return static_cast<void*>(block_header + 1); //Points to user's memory (just after metadata aka header)
     }
 
-    total_size = sizeof(header_t) + size;
-    block = sbrk(total_size);   // Moves brk to the total size
+    size_t total_size = sizeof(header_t) + size;
+
+    if(!head)
+    {
+      uintptr_t current_break = (uintptr_t)sbrk(0);
+      uintptr_t aligned_break = align_up(current_break);
+
+      if(aligned_break - current_break > 0)
+      {
+        sbrk(aligned_break - current_break);
+      }
+    }
+    block = sbrk(total_size);
 
     if(block == reinterpret_cast<void*>(-1))
     {
@@ -76,14 +145,15 @@ inline void* my_malloc(size_t size)
     }
     
     block_header = static_cast<header_t*>(block);   // Assign block pointer to block header 
-    block_header->s.size = size;
-    block_header->s.is_free = 0;
-    block_header->s.next = NULL;
-    
+    block_header->size = size;
+    block_header->is_free = 0;
+    block_header->next = NULL;
+    block_header->prev = tail;
+
     if(!head)
         head = block_header;
     if(tail)
-        tail->s.next = block_header;
+        tail->next = block_header;
 
     tail = block_header;
     pthread_mutex_unlock(&global_malloc_lock);
@@ -93,45 +163,26 @@ inline void* my_malloc(size_t size)
 
 inline void my_free(void *block)
 {
-    header_t *block_header , *tmp;
-
-    void *programbreak;
-
     if(!block)
         return;
+
     pthread_mutex_lock(&global_malloc_lock);
-    block_header = static_cast<header_t*>(block) - 1;
+    header_t* block_header = static_cast<header_t*>(block) - 1;
 
-    programbreak = sbrk(0); // Retrives the size
-    if(static_cast<char*>(block) + block_header->s.size == programbreak)
+    block_header->is_free = 1; // Marks as free
+
+    // Cascade with adjacent free neighbour blocks
+    block_header = merge_block(block_header);
+
+    // Cascade shrink as many trailing free block as possible
+    while(tail && tail->is_free && (static_cast<char*>(static_cast<void*>(tail + 1)) + tail->size == sbrk(0)))
     {
-        if(head == tail)
-        {
-            head = tail = nullptr;
-        }
-        else 
-        {
-            tmp = head;
-            while(tmp)
-                {
-                    if(tmp->s.next == tail)
-                    {
-                        tmp->s.next = nullptr;
-                        tail = tmp;
-                        break;
-                    }
-                    tmp = tmp->s.next;
-                }
-        }
-
-        intptr_t shrink_size = sizeof(header_t) + block_header->s.size;     // Calculating size to shrink
+        intptr_t shrink_size = sizeof(header_t) + tail->size;
+        tail = tail->prev;
+        if(tail) tail->next = nullptr;
+        else head = nullptr;
         sbrk(-shrink_size);
-
-        pthread_mutex_unlock(&global_malloc_lock);
-        return;
     }
-
-    block_header->s.is_free = 1;    
     pthread_mutex_unlock(&global_malloc_lock);
 }
 
@@ -157,6 +208,7 @@ inline void* my_calloc(size_t num, size_t nsize)
 
 inline void *my_realloc(void *ptr, size_t size)
 {
+    size = align_up(size);
     header_t* header;
     void* ret;
 
@@ -170,14 +222,14 @@ inline void *my_realloc(void *ptr, size_t size)
     }
     header = static_cast<header_t*>(ptr) - 1;
 
-    if(header->s.size >= size)
+    if(header->size >= size)
         return ptr;
 
     ret = my_malloc(size);
 
     if(ret)
     {
-        std::memcpy(ret, ptr, header->s.size);     // Copying old memory block to new one
+        std::memcpy(ret, ptr, header->size);     // Copying old memory block to new one
         my_free(ptr);     // Freeing old memory block
     }
     return ret;
