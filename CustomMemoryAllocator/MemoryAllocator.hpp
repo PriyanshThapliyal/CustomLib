@@ -5,8 +5,13 @@
 #include <cstdint>
 #include <pthread.h>
 #include <cstring>
+#include <sys/mman.h>
 
+// Aligment size
 constexpr size_t ALIGNMENT = 16;
+
+//MMAP_Threshold 128 Kb
+constexpr size_t MMAP_THRESHOLD = 128 * 1024;
 
 // Align up round up input byte to multiple of 16
 inline size_t align_up(size_t size)
@@ -22,13 +27,57 @@ inline size_t align_up(size_t size)
 struct alignas(16) header{
         size_t size;
         unsigned is_free;
+        unsigned is_mmap;
         header *next;
         header *prev;
 };
 
 typedef  header header_t;
 
+// Setting up Seggregated BIN
+constexpr size_t MIN_BIN_SIZE = 16;
+constexpr size_t NUM_BINS = 14;
+// from 16 B to 128 Kb
+inline header_t* bins[NUM_BINS] = {nullptr};
 
+// Method to get the Seggregated Bin index
+inline size_t get_bin_index(size_t size)
+{
+    if(size <= MIN_BIN_SIZE) return 0;
+
+    //Fast log2 calculation for 64-bit numbers
+    //64 - __builtin_clzll(size -1) calculates ceil(log2(size))  
+    size_t power = 64 - __builtin_clzll(size -1);
+
+    // Bin 0 is 16 bytes (2^4), so subtract 4
+    size_t index = (power >= 4) ? (power - 4) : 0;
+    if(index >= NUM_BINS) index = NUM_BINS - 1;
+    return index;
+}
+
+//Method to puch bin in the Seggregated Bin List
+inline void bin_push(header_t* block)
+{
+    size_t idx = get_bin_index(block->size);
+    block->next = bins[idx];
+    block->prev = nullptr;
+    if(bins[idx])
+    {
+        bins[idx]->prev = block;
+    }
+    bins[idx] = block;
+}
+
+inline void bin_remove(header_t* block)
+{
+    size_t idx = get_bin_index(block->size);
+    if(block->prev)
+        block->prev->next = block->next;
+    else
+        bins[idx] = block->next;
+    if(block->next)
+        block->next->prev = block->prev; 
+}
 // Global thread lock
 inline pthread_mutex_t global_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -75,15 +124,17 @@ inline header_t* merge_block(header_t *block_header)
 
     if(block_header->prev && block_header->prev->is_free)
     {
-        block_header->prev->size += sizeof(header_t) + block_header->size;
-        block_header->prev->next = block_header->next;
+        header_t* prev_block =  block_header->prev;
+        prev_block->size += sizeof(header_t) + block_header->size;
+        prev_block->next = block_header->next;
+        
         if(block_header->next)
-            block_header->next->prev = block_header->prev;
+            block_header->next->prev = prev_block;
         else 
-            tail = block_header->prev;
+            tail = prev_block;
+        block_header = prev_block;
+
     }
-    if(block_header->prev && block_header->prev->is_free)
-        block_header = block_header->prev;
     return block_header;
 
 }
@@ -107,13 +158,43 @@ inline header_t *get_free_block(size_t size)
 inline void* my_malloc(size_t size)
 {   
     size = align_up(size);
-    void* block; // pointer to Memory block allocated
-    header_t* block_header; // Pointer to Metadata 
-                            
+
     if(!size)
-        return NULL;
-        
+        return nullptr;
+ 
+    size_t total_size = sizeof(header_t) + size;
+    
+    // Large Allocation via mmap()
+    if(total_size >= MMAP_THRESHOLD)
+    {
+        size_t page_size = sysconf(_SC_PAGESIZE);
+        total_size = ((total_size + (page_size - 1)) & ~(page_size - 1));
+
+        void* block = mmap(nullptr,
+                           total_size,
+                           PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS,
+                           -1,
+                           0);
+
+        if(block == MAP_FAILED)
+            return nullptr;
+
+        header_t* block_header = static_cast<header_t*>(block);
+        block_header->size = total_size - sizeof(header_t);
+        block_header->is_free = 0;
+        block_header->is_mmap = 1;
+        block_header->next = nullptr;
+        block_header->prev = nullptr;
+
+        return static_cast<void*>(block_header + 1);
+    }
+       
+    // Small Allocation via Heap(sbrk/bins)
     pthread_mutex_lock(&global_malloc_lock); // Locking thread
+
+    header_t* block_header;
+    void* block;
 
     block_header = get_free_block(size);  // Calling get_free_block() to get the memory address
 
@@ -124,7 +205,6 @@ inline void* my_malloc(size_t size)
         return static_cast<void*>(block_header + 1); //Points to user's memory (just after metadata aka header)
     }
 
-    size_t total_size = sizeof(header_t) + size;
 
     if(!head)
     {
@@ -147,6 +227,7 @@ inline void* my_malloc(size_t size)
     block_header = static_cast<header_t*>(block);   // Assign block pointer to block header 
     block_header->size = size;
     block_header->is_free = 0;
+    block_header->is_mmap = 0;
     block_header->next = NULL;
     block_header->prev = tail;
 
@@ -166,8 +247,18 @@ inline void my_free(void *block)
     if(!block)
         return;
 
-    pthread_mutex_lock(&global_malloc_lock);
     header_t* block_header = static_cast<header_t*>(block) - 1;
+
+    // Returning pages directly to the OS using unmap()
+    if(block_header->is_mmap)
+    {
+        size_t total_size = sizeof(header_t) + block_header->size;
+
+        munmap(block_header, total_size);
+        return;
+    }
+
+    pthread_mutex_lock(&global_malloc_lock);
 
     block_header->is_free = 1; // Marks as free
 
